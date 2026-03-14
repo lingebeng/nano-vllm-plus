@@ -46,12 +46,14 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        prefill_seqs, chunk_sizes, decode_seqs = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", prefill_seqs, chunk_sizes, decode_seqs)
+        self.scheduler.postprocess(prefill_seqs, chunk_sizes, decode_seqs, token_ids)
+        all_seqs = prefill_seqs + decode_seqs
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in all_seqs if seq.is_finished]
+        num_prefill_tokens = sum(chunk_sizes)
+        num_decode_seqs = len(decode_seqs)
+        return outputs, num_prefill_tokens, num_decode_seqs
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -72,12 +74,13 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_prefill_tokens, num_decode_seqs = self.step()
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                dt = perf_counter() - t
+                if num_prefill_tokens > 0:
+                    prefill_throughput = num_prefill_tokens / dt
+                if num_decode_seqs > 0:
+                    decode_throughput = num_decode_seqs / dt
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",

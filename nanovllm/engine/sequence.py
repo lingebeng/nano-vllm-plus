@@ -23,6 +23,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -37,6 +38,14 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def is_prefilling(self):
+        return self.num_computed_tokens < self.num_prompt_tokens
+
+    @property
+    def num_uncomputed_tokens(self):
+        return self.num_prompt_tokens - self.num_computed_tokens
 
     @property
     def num_completion_tokens(self):
@@ -72,11 +81,12 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+                self.num_computed_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_computed_tokens, self.block_table = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

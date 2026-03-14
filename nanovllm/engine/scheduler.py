@@ -21,49 +21,94 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
-        scheduled_seqs = []
+    def schedule(self) -> tuple[list[Sequence], list[int], list[Sequence]]:
+        """Returns (prefill_seqs, chunk_sizes, decode_seqs)."""
+        budget = self.max_num_batched_tokens
         num_seqs = 0
-        num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                break
+        prefill_seqs = []
+        chunk_sizes = []
+        decode_seqs = []
+
+        # Step 1: schedule running sequences (decode + continuing prefill)
+        new_running = deque()
+        for seq in self.running:
+            if num_seqs >= self.max_num_seqs or budget <= 0:
+                new_running.append(seq)
+                continue
+            if seq.is_prefilling:
+                chunk = min(seq.num_uncomputed_tokens, budget)
+                if chunk == 0:
+                    new_running.append(seq)
+                    continue
+                budget -= chunk
+                prefill_seqs.append(seq)
+                chunk_sizes.append(chunk)
+            else:
+                if not self.block_manager.can_append(seq):
+                    # try preemption
+                    if new_running:
+                        self.preempt(new_running.pop())
+                    elif self.running:
+                        # skip this seq, will be preempted
+                        self.preempt(seq)
+                        continue
+                    else:
+                        self.preempt(seq)
+                        continue
+                self.block_manager.may_append(seq)
+                budget -= 1
+                decode_seqs.append(seq)
             num_seqs += 1
+
+        # Step 2: schedule new sequences from waiting
+        while self.waiting and num_seqs < self.max_num_seqs and budget > 0:
+            seq = self.waiting[0]
+            if not self.block_manager.can_allocate(seq):
+                break
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            seq.num_computed_tokens = seq.num_cached_tokens
+            remaining = seq.num_uncomputed_tokens
+            chunk = min(remaining, budget)
+            if chunk == 0:
+                break
+            budget -= chunk
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            return scheduled_seqs, True
+            prefill_seqs.append(seq)
+            chunk_sizes.append(chunk)
+            num_seqs += 1
 
-        # decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        # Rebuild running queue: decode + prefill + deferred
+        self.running = deque(decode_seqs + prefill_seqs)
+        self.running.extend(new_running)
+
+        return prefill_seqs, chunk_sizes, decode_seqs
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        seq.num_computed_tokens = 0
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
+    def postprocess(self, prefill_seqs: list[Sequence], chunk_sizes: list[int],
+                    decode_seqs: list[Sequence], token_ids: list[int]):
+        """Process results. token_ids covers completed-prefill seqs + decode seqs."""
+        tid_idx = 0
+
+        for seq, chunk in zip(prefill_seqs, chunk_sizes):
+            seq.num_computed_tokens += chunk
+            if not seq.is_prefilling:
+                # prefill just completed, consume one sampled token
+                seq.append_token(token_ids[tid_idx])
+                tid_idx += 1
+                if (not seq.ignore_eos and token_ids[tid_idx - 1] == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+
+        for seq in decode_seqs:
+            token_id = token_ids[tid_idx]
+            tid_idx += 1
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
