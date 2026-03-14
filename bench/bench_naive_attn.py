@@ -1,3 +1,8 @@
+"""
+Benchmark: Naive PyTorch SDPA attention vs custom Triton kernel.
+Uses NANO_NAIVE_ATTN=1 to switch decode attention to torch SDPA.
+Must use enforce_eager=True since naive attention doesn't support CUDA graph.
+"""
 import os
 import time
 from random import randint, seed
@@ -11,7 +16,8 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    # enforce_eager=True to skip CUDA graph (naive attn doesn't support it)
+
+    os.environ["NANO_NAIVE_ATTN"] = "1"
     llm = LLM(path, enforce_eager=True, enable_chunked_prefill=False, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
