@@ -34,6 +34,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, 'model_runner'):
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -44,6 +46,7 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         prefill_seqs, chunk_sizes, decode_seqs = self.scheduler.schedule()
@@ -52,8 +55,10 @@ class LLMEngine:
         all_seqs = prefill_seqs + decode_seqs
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in all_seqs if seq.is_finished]
         num_prefill_tokens = sum(chunk_sizes)
-        num_decode_seqs = len(decode_seqs)
-        return outputs, num_prefill_tokens, num_decode_seqs
+        decode_seq_ids = [seq.seq_id for seq in decode_seqs]
+        first_token_seq_ids = [seq.seq_id for seq in prefill_seqs
+                               if not seq.is_prefilling and seq.num_completion_tokens >= 1]
+        return outputs, num_prefill_tokens, decode_seq_ids, first_token_seq_ids
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -74,13 +79,13 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_prefill_tokens, num_decode_seqs = self.step()
+            output, num_prefill_tokens, decode_seq_ids, first_token_seq_ids = self.step()
             if use_tqdm:
                 dt = perf_counter() - t
                 if num_prefill_tokens > 0:
                     prefill_throughput = num_prefill_tokens / dt
-                if num_decode_seqs > 0:
-                    decode_throughput = num_decode_seqs / dt
+                if decode_seq_ids:
+                    decode_throughput = len(decode_seq_ids) / dt
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",

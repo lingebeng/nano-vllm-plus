@@ -12,6 +12,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.enable_chunked_prefill = config.enable_chunked_prefill
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -31,6 +32,7 @@ class Scheduler:
 
         # Step 1: schedule running sequences (decode + continuing prefill)
         new_running = deque()
+        has_prefilling = not self.enable_chunked_prefill and any(seq.is_prefilling for seq in self.running)
         for seq in self.running:
             if num_seqs >= self.max_num_seqs or budget <= 0:
                 new_running.append(seq)
@@ -44,6 +46,9 @@ class Scheduler:
                 prefill_seqs.append(seq)
                 chunk_sizes.append(chunk)
             else:
+                if has_prefilling:
+                    new_running.append(seq)
+                    continue
                 if not self.block_manager.can_append(seq):
                     # try preemption
                     if new_running:

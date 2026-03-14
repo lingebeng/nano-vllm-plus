@@ -92,10 +92,11 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seq_len = min(max_num_batched_tokens, max_model_len)
+        num_seqs = max(1, min(max_num_batched_tokens // seq_len, self.config.max_num_seqs))
+        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         # Warmup with prefill-only batch
-        self.run(seqs, [max_model_len] * num_seqs, [])
+        self.run(seqs, [seq_len] * num_seqs, [])
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
