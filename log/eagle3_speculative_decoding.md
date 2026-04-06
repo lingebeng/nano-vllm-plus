@@ -347,3 +347,259 @@ aux_hidden ──→ fc(3H→H) or identity ──→ hidden ┘                
 hidden_states ──→ norm ──→ lm_head(H→32K) ──→ draft_logits
 draft_logits ──→ argmax ──→ draft_id + d2t[draft_id] ──→ target_id
 ```
+
+---
+
+## 七、性能优化：从 1.36x 到 2.55x
+
+### 7.1 优化前基线（第四节结果）
+
+| 批次大小 | 基线 (tok/s) | 投机 (tok/s) | 平均 token/cycle | 加速比 |
+|---------|-------------|-------------|-----------------|--------|
+| 1       | 34.9        | 47.5        | 2.94            | 1.36x  |
+| 4       | 132.3       | 157.2       | 2.74            | 1.19x  |
+| 16      | 500.8       | 588.2       | 3.15            | 1.17x  |
+
+### 7.2 瓶颈分析
+
+通过 profiling 分析原始 cycle 各阶段耗时（BS=1）：
+
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| Phase 1: Target Decode | ~29ms | 目标模型前向（1 token）+ 采样 + 辅助隐藏状态提取 |
+| Phase 2: Draft × 3 | ~5ms | Draft 模型 3 步自回归 |
+| Phase 3: Target Verify | ~13ms | 目标模型前向（K+1=4 tokens）作为 prefill 段 |
+| Phase 4: Accept/Reject + KV 更新 | ~15ms | 包括 CPU-GPU 同步、内存分配、KV 裁剪 |
+| **合计** | **~62ms** | |
+
+**关键发现**：Phase 1（Target Decode）占 cycle 时间的 47%，但它只产出 1 个 token（t0）。Phase 3 已经通过 verify 产出了相同信息——verify_logits[0] 的 argmax 就等于 t0。如果能复用上一 cycle 的 verify 结果，就可以完全跳过 Phase 1。
+
+### 7.3 优化 1：Merged Mode（跳过 Phase 1）
+
+**核心思想**：在 Phase 3 verify 完成后，除了得到 accept/reject 结果，还得到了 correction token 和对应位置的辅助隐藏状态。这些信息正好是下一 cycle Phase 1 的输出。
+
+**实现**：
+
+1. 在 `__init__` 中增加 `self._prev_correction = {}` 存储每个序列上一 cycle 的 correction 信息
+
+2. 修改 `_run_verify()` 使其同时提取 verify 阶段的辅助隐藏状态（通过 forward hooks）：
+```python
+def _run_verify(self, decode_seqs, start_list, draft_tokens_list, base_offset=0):
+    # ...
+    # 使用 hooks 提取 aux_hidden
+    aux_captures = []
+    hooks = []
+    for layer_idx in sorted(self.aux_layer_ids):
+        def make_hook(idx):
+            def hook_fn(module, input, output):
+                h, r = output
+                aux_captures.append((idx, (h + r).detach()))
+            return hook_fn
+        hooks.append(self.model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+    hidden_states = self.model(input_ids_t, positions_t)
+    for h in hooks:
+        h.remove()
+    # ...
+    return logits, verify_aux  # (N, K+1, vocab), (N, K+1, 3*H)
+```
+
+3. 修改 `run_speculative()` 主流程：
+```python
+def run_speculative(self, decode_seqs):
+    merged = all(seq.seq_id in self._prev_correction for seq in decode_seqs)
+
+    if merged:
+        # 跳过 Phase 1，复用上一 cycle 的 correction
+        start_tokens = [self._prev_correction[seq.seq_id][0] for ...]
+        start_aux = [self._prev_correction[seq.seq_id][1] for ...]
+    else:
+        # 首次 cycle：正常执行 Phase 1
+        ...
+
+    # Phase 2: Draft（不变）
+    # Phase 3: Verify（merged 时 base_offset=-1）
+    base_offset = -1 if merged else 0
+    verify_logits, verify_aux = self._run_verify(..., base_offset)
+
+    # Phase 4: Accept/Reject
+    for i, seq in enumerate(decode_seqs):
+        na = num_accepted_cpu[i]
+        if merged:
+            seq_tokens = [draft_tokens_list[k][i] for k in range(na)]
+        else:
+            seq_tokens = [start_list[i]] + [draft_tokens_list[k][i] for k in range(na)]
+        seq_tokens.append(correction)
+
+    # 保存 correction 供下一 cycle 使用
+    for i, seq in enumerate(decode_seqs):
+        na = num_accepted_cpu[i]
+        self._prev_correction[seq.seq_id] = (accepted[i][-1], verify_aux[i, na])
+```
+
+4. Merged 模式的位置计算：
+```python
+# 原始模式：verify 从 len(seq) 开始（Phase 1 已写入 KV cache）
+# Merged 模式：verify 从 len(seq)-1 开始（correction 的 KV 还未写入）
+base_pos = len(seq) + base_offset
+```
+
+**Merged 模式的 token 产出**：
+- 原始模式：t0 + na + correction = na + 2 tokens/cycle
+- Merged 模式：na + correction = na + 1 tokens/cycle（t0 不再单独产出，因为上一 cycle 的 correction 就是本 cycle 的"起始 token"，已被上一 cycle 计数）
+
+**关键权衡**：虽然每 cycle 少产出 1 个 token，但 cycle 时间从 ~62ms 降至 ~37ms（节省 ~29ms Phase 1），净效果正向。
+
+### 7.4 优化 2：Draft Prefill（提升接受率）
+
+**问题**：原始实现中 draft 模型的 KV cache 从空开始，在第一个 decode cycle 时对 prompt 没有任何上下文记忆。
+
+**实现**：在 target 模型 prefill 阶段，通过 forward hooks 提取辅助隐藏状态，然后将完整 prompt 通过 draft 模型建立初始 KV cache。
+
+```python
+# 在 run() 中，prefill 时提取 aux_hidden
+def run(self, prefill_seqs, chunk_sizes, decode_seqs):
+    need_draft_prefill = has_prefill and self.draft_model is not None
+    if need_draft_prefill:
+        # 使用 hooks 提取辅助隐藏状态
+        aux_captures = []
+        hooks = []
+        for layer_idx in sorted(self.aux_layer_ids):
+            hooks.append(self.model.model.layers[layer_idx].register_forward_hook(...))
+        hidden_states = self.run_model(input_ids, positions, has_prefill)
+        for h in hooks:
+            h.remove()
+        aux_hidden = torch.cat([c[1] for c in aux_captures], dim=-1)
+    # ...
+    if need_draft_prefill:
+        self._accumulate_draft_prefill(prefill_seqs, chunk_sizes, aux_hidden)
+```
+
+支持 chunked prefill——逐 chunk 累积 aux_hidden，当 prefill 完成时合并并运行 draft prefill：
+
+```python
+def _accumulate_draft_prefill(self, prefill_seqs, chunk_sizes, aux_hidden):
+    for seq, chunk in zip(prefill_seqs, chunk_sizes):
+        self._prefill_aux_chunks[seq.seq_id].append(chunk_aux)
+        if seq.num_computed_tokens + chunk >= seq.num_prompt_tokens:
+            full_aux = torch.cat(self._prefill_aux_chunks.pop(seq.seq_id), dim=0)
+            self._draft_prefill(seq, full_aux)
+
+def _draft_prefill(self, seq, prompt_aux_hidden):
+    prompt_ids = torch.tensor(seq.prompt_token_ids, ...).unsqueeze(0)
+    positions = torch.arange(seq.num_prompt_tokens, ...).unsqueeze(0)
+    aux = prompt_aux_hidden.unsqueeze(0)
+    _, _, draft_kv = self.draft_model(prompt_ids, aux, positions, past_kv=None)
+    self.draft_kv_cache[seq.seq_id] = (draft_kv[0], draft_kv[1])
+```
+
+### 7.5 优化 3：Forward Hooks 替代 aux_layer_ids 参数
+
+**问题**：最初通过给 `Qwen3Model.forward()` 传入 `aux_layer_ids` 参数来提取辅助隐藏状态。但这改变了模型的输入/输出签名，导致 `torch.compile` 反复重编译（RMSNorm 看到不同 rank 的张量：有 aux_layer_ids 时返回 tuple，没有时返回 tensor）。
+
+**修复**：使用 PyTorch forward hooks，在不改变模型签名的情况下捕获中间层输出：
+
+```python
+for layer_idx in sorted(self.aux_layer_ids):
+    def make_hook(idx):
+        def hook_fn(module, input, output):
+            h, r = output  # Qwen3DecoderLayer 返回 (hidden_states, residual)
+            aux_captures.append((idx, (h + r).detach()))
+        return hook_fn
+    hooks.append(self.model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+```
+
+`h + r` 等价于 `hidden_states + residual`，即经过 input_layernorm 融合后的真实隐藏状态。与 `aux_layer_ids` 代码路径中的 `hidden_states + residual` 完全一致。
+
+### 7.6 未采用的优化：Correction Token 回填
+
+**尝试**：每 cycle 结束后，将 correction token 通过 draft 模型前向传播，填补 draft KV cache 中的上下文空洞。
+
+**结果**：额外的 draft 前向传播（~2ms）+ KV 拷贝开销抵消了接受率的微小改善（~0.2 tokens/cycle）。
+
+**分析**：在 merged 模式下，correction token 自然会在下一 cycle 的 Phase 2 第 0 步被处理（作为 `start_tokens` 输入），其 KV 条目会正常添加到 draft KV cache 中。因此 KV cache 中唯一的"空洞"是当前 cycle 的 correction，它会在下一 cycle 立即被填补。在这种情况下，显式回填的边际收益不足以覆盖其开销。
+
+### 7.7 优化后性能结果
+
+Qwen3-8B + EAGLE3, K=3, max_tokens=512, enforce_eager=True：
+
+| 批次大小 | 基线 (tok/s) | 投机 (tok/s) | 平均 token/cycle | 加速比 |
+|---------|-------------|-------------|-----------------|--------|
+| 1       | 33.4        | 85.1        | 3.41            | **2.55x** |
+| 4       | 123.1       | 160.1       | 2.67            | **1.30x** |
+| 16      | 463.0       | 664.8       | 2.98            | **1.44x** |
+
+### 7.8 优化后 Cycle 耗时分解（BS=1, Merged Mode）
+
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| Phase 1 (Merged 设置) | 0.1ms | 从 `_prev_correction` 读取 tensor |
+| Phase 2 (Draft × 3) | 5.3ms | 3 步 draft 自回归 |
+| Phase 3 (Verify) | 31.2ms | 目标模型前向（4 tokens prefill）+ hooks 提取 aux |
+| Phase 4 (Accept + KV 更新) | 0.25ms | 向量化 accept/reject + KV 裁剪 |
+| **合计** | **~37ms** | 比优化前 62ms 减少 40% |
+
+### 7.9 进化总结
+
+| 阶段 | BS=1 加速 | BS=16 加速 | 主要变化 |
+|------|----------|----------|---------|
+| 初始实现 | ~1.0x | ~1.0x | 辅助层索引错误，无持久 KV |
+| 修复辅助层 + 回声 | ~1.0x | ~1.0x | 接受率 ~4-5%，太低无加速 |
+| 持久 KV（逐序列） | 1.14x | 0.65x | 接受率 19-31%，大批次退化 |
+| 批量化 + 位置修复 + 注意力 mask | 1.36x | 1.17x | 所有批次正向加速 |
+| **Merged Mode + Draft Prefill + Hooks** | **2.55x** | **1.44x** | 跳过 Phase 1，draft 有 prompt 上下文 |
+
+---
+
+## 八、核心流程（优化后）
+
+### 优化后流程（`model_runner.py::run_speculative`，Merged Mode）
+
+```
+┌─────────────────────────────────────────────┐
+│ Phase 1: Merged Setup (0.1ms)               │
+│   start_tokens = _prev_correction[seq][0]   │
+│   start_aux = _prev_correction[seq][1]      │
+│   (首次 cycle 回退到 target decode + hooks) │
+├─────────────────────────────────────────────┤
+│ Phase 2: Draft K Tokens (5.3ms)             │
+│   past_kv, kv_lengths = get_batched_kv()    │
+│   for k in range(K):                        │
+│     positions = kv_lengths + k              │
+│     h, logits, past_kv = draft_model(       │
+│       input, aux, positions, past_kv,       │
+│       kv_valid_lens=kv_lengths+k)           │
+│     draft_tokens[k] = greedy_sample(logits) │
+├─────────────────────────────────────────────┤
+│ Phase 3: Target Verify (31ms)               │
+│   verify_input = [start, d1, ..., dK]       │
+│   base_pos = len(seq) - 1  (merged)         │
+│   verify_logits, verify_aux = _run_verify(  │
+│     ..., base_offset=-1)                    │
+│   # hooks 同时提取 aux_hidden 供下一 cycle  │
+├─────────────────────────────────────────────┤
+│ Phase 4: Accept/Reject (0.25ms)             │
+│   matches = (target_preds[:,:K] == drafts)  │
+│   num_accepted = cumprod(matches).sum(dim=1)│
+│   accepted = [d1..d_na, correction]         │
+│   _prev_correction[seq] = (correction,      │
+│                             verify_aux[na])  │
+│   _update_draft_kv(trim rejected entries)   │
+└─────────────────────────────────────────────┘
+```
+
+### Merged vs Original 模式对比
+
+```
+Original (首次 cycle):
+  Phase 1 (29ms) → Phase 2 (5ms) → Phase 3 (13ms) → Phase 4 (15ms) = 62ms
+  产出: t0 + na + correction = na + 2 tokens
+
+Merged (后续 cycle):
+  Phase 1 (0.1ms) → Phase 2 (5ms) → Phase 3 (31ms) → Phase 4 (0.25ms) = 37ms
+  产出: na + correction = na + 1 tokens
+  （correction 复用为下一 cycle 的起始 token）
+
+注: Phase 3 在 merged 模式下比 original 慢（31ms vs 13ms），因为 verify 使用 hooks
+提取 aux_hidden，而 original 的 Phase 3 不需要 hooks（aux 在 Phase 1 已提取）。
+但总体仍快 40%，因为完全跳过了 Phase 1 的 target decode。
+```

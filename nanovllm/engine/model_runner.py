@@ -1,5 +1,6 @@
 import json
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -32,17 +33,20 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+
+        # Speculative decoding: load draft model (before warmup so run() can check)
+        self.draft_model = None
+        self.aux_layer_ids = None
+        self.draft_kv_cache = {}  # seq_id → (K, V) tensors for draft model
+        self._prefill_aux_chunks = {}  # seq_id → list of aux_hidden chunks for draft prefill
+        self._prev_correction = {}  # seq_id → (token_id, aux_hidden) from previous cycle's verify
+        if config.speculative_model:
+            self._load_draft_model(config)
+
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
-
-        # Speculative decoding: load draft model
-        self.draft_model = None
-        self.aux_layer_ids = None
-        self.draft_kv_cache = {}  # seq_id → (K, V) tensors for draft model
-        if config.speculative_model:
-            self._load_draft_model(config)
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -104,8 +108,11 @@ class ModelRunner:
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = max(1, min(max_num_batched_tokens // seq_len, self.config.max_num_seqs))
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        # Warmup with prefill-only batch
+        # Warmup with prefill-only batch (skip draft prefill)
+        saved = self.draft_model
+        self.draft_model = None
         self.run(seqs, [seq_len] * num_seqs, [])
+        self.draft_model = saved
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -248,7 +255,28 @@ class ModelRunner:
         input_ids, positions = self.prepare_chunked_prefill(prefill_seqs, chunk_sizes, decode_seqs)
         has_prefill = len(prefill_seqs) > 0
 
-        hidden_states = self.run_model(input_ids, positions, has_prefill)
+        # Extract aux_hidden during prefill for draft model initialization
+        need_draft_prefill = has_prefill and self.draft_model is not None
+        if need_draft_prefill:
+            # Use forward hooks to capture aux hidden states without disturbing torch.compile
+            aux_captures = []
+            hooks = []
+            for layer_idx in sorted(self.aux_layer_ids):
+                def make_hook(idx):
+                    def hook_fn(module, input, output):
+                        h, r = output
+                        aux_captures.append((idx, (h + r).detach()))
+                    return hook_fn
+                hooks.append(self.model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+            hidden_states = self.run_model(input_ids, positions, has_prefill)
+            for h in hooks:
+                h.remove()
+            # Sort by layer index and concatenate
+            aux_captures.sort(key=lambda x: x[0])
+            aux_hidden = torch.cat([c[1] for c in aux_captures], dim=-1)
+        else:
+            hidden_states = self.run_model(input_ids, positions, has_prefill)
+            aux_hidden = None
 
         # Extract hidden states for positions that need sampling:
         # - last token of each prefill seq that completes prefill
@@ -270,6 +298,9 @@ class ModelRunner:
             sample_seqs.append(seq)
 
         if not sample_indices:
+            # Handle draft prefill even when no sampling needed
+            if need_draft_prefill:
+                self._accumulate_draft_prefill(prefill_seqs, chunk_sizes, aux_hidden)
             reset_context()
             return []
 
@@ -283,8 +314,40 @@ class ModelRunner:
         else:
             token_ids = None
 
+        # Draft prefill: accumulate aux_hidden chunks and run when prefill completes
+        if need_draft_prefill:
+            self._accumulate_draft_prefill(prefill_seqs, chunk_sizes, aux_hidden)
+
         reset_context()
         return token_ids
+
+    # ---- Draft prefill ----
+
+    @torch.inference_mode()
+    def _accumulate_draft_prefill(self, prefill_seqs, chunk_sizes, aux_hidden):
+        """Accumulate aux_hidden chunks during prefill and run draft prefill when complete."""
+        offset = 0
+        for seq, chunk in zip(prefill_seqs, chunk_sizes):
+            chunk_aux = aux_hidden[offset:offset + chunk]
+            if seq.seq_id not in self._prefill_aux_chunks:
+                self._prefill_aux_chunks[seq.seq_id] = []
+            self._prefill_aux_chunks[seq.seq_id].append(chunk_aux)
+            offset += chunk
+
+            # Check if this chunk completes prefill
+            if seq.num_computed_tokens + chunk >= seq.num_prompt_tokens:
+                chunks = self._prefill_aux_chunks.pop(seq.seq_id)
+                full_aux = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                self._draft_prefill(seq, full_aux)
+
+    @torch.inference_mode()
+    def _draft_prefill(self, seq, prompt_aux_hidden):
+        """Run entire prompt through draft model to build initial KV cache."""
+        prompt_ids = torch.tensor(seq.prompt_token_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+        positions = torch.arange(seq.num_prompt_tokens, dtype=torch.long, device="cuda").unsqueeze(0)
+        aux = prompt_aux_hidden.unsqueeze(0)  # (1, prompt_len, 3*H)
+        _, _, draft_kv = self.draft_model(prompt_ids, aux, positions, past_kv=None)
+        self.draft_kv_cache[seq.seq_id] = (draft_kv[0], draft_kv[1])
 
     # ---- Speculative decoding ----
 
@@ -328,45 +391,67 @@ class ModelRunner:
         K = self.num_speculative_tokens
         N = len(decode_seqs)
 
-        # === Phase 1: Target decode (1 token/seq) → logits + aux hidden states ===
-        input_ids, positions = self.prepare_chunked_prefill([], [], decode_seqs)
-        result = self.model(input_ids, positions, aux_layer_ids=self.aux_layer_ids)
-        hidden_states, aux_hidden = result  # aux_hidden: (N, 3*H)
+        # Check if we can skip Phase 1 (all seqs have prev correction info)
+        merged = all(seq.seq_id in self._prev_correction for seq in decode_seqs)
 
-        target_logits = self.model.compute_logits(hidden_states)  # (N, vocab)
-        t0_tokens = target_logits.argmax(dim=-1)  # (N,)
-        reset_context()
+        if merged:
+            # === Merged mode: skip Phase 1, reuse previous cycle's correction ===
+            start_tokens = torch.tensor(
+                [self._prev_correction[seq.seq_id][0] for seq in decode_seqs],
+                dtype=torch.long, device="cuda")
+            start_aux = torch.stack(
+                [self._prev_correction[seq.seq_id][1] for seq in decode_seqs])
+            start_list = start_tokens.tolist()
+        else:
+            # === Phase 1: Target decode (1 token/seq) → logits + aux hidden states ===
+            input_ids, positions = self.prepare_chunked_prefill([], [], decode_seqs)
+            aux_captures = []
+            hooks = []
+            for layer_idx in sorted(self.aux_layer_ids):
+                def make_hook(idx):
+                    def hook_fn(module, input, output):
+                        h, r = output
+                        aux_captures.append((idx, (h + r).detach()))
+                    return hook_fn
+                hooks.append(self.model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+            hidden_states = self.run_model(input_ids, positions, False)
+            for h in hooks:
+                h.remove()
+            aux_captures.sort(key=lambda x: x[0])
+            start_aux = torch.cat([c[1] for c in aux_captures], dim=-1)  # (N, 3*H)
+            target_logits = self.model.compute_logits(hidden_states)  # (N, vocab)
+            start_tokens = target_logits.argmax(dim=-1)  # (N,)
+            start_list = start_tokens.tolist()
+            reset_context()
 
         # === Phase 2: Draft K tokens with persistent KV cache (batched) ===
         all_draft_tokens = torch.empty(K, N, dtype=torch.long, device="cuda")
-
-        # Build batched past_kv from per-sequence caches
         past_kv, kv_lengths = self._get_batched_draft_kv(decode_seqs)
         draft_hidden = None
 
         for k in range(K):
             if k == 0:
-                d_input = t0_tokens  # (N,)
-                d_aux = aux_hidden  # (N, 3*H)
+                d_input = start_tokens
+                d_aux = start_aux
             else:
                 d_input = all_draft_tokens[k - 1]
-                d_aux = draft_hidden  # (N, H)
+                d_aux = draft_hidden
 
-            # Use contiguous positions based on draft KV cache length
             d_positions = kv_lengths + k
-
             draft_h, draft_logits_raw, past_kv = self.draft_model(
                 d_input, d_aux, d_positions, past_kv, kv_lengths + k
             )
-            draft_hidden = draft_h[:, -1, :]  # (N, H)
+            draft_hidden = draft_h[:, -1, :]
             all_draft_tokens[k] = self.draft_model.greedy_sample(draft_logits_raw[:, -1:, :])[:, 0]
 
-        # Convert draft tokens for verify and accept
         draft_tokens_list = [all_draft_tokens[k].tolist() for k in range(K)]
-        t0_list = t0_tokens.tolist()
 
         # === Phase 3: Target verify (K+1 tokens/seq) ===
-        verify_logits = self._run_verify(decode_seqs, t0_list, draft_tokens_list)
+        # In merged mode: verify [correction, d1..dK] starting at len(seq)-1
+        # In original mode: verify [t0, d1..dK] starting at len(seq)
+        base_offset = -1 if merged else 0
+        verify_logits, verify_aux = self._run_verify(
+            decode_seqs, start_list, draft_tokens_list, base_offset)
 
         # === Phase 4: Vectorized accept/reject ===
         target_preds = verify_logits.argmax(dim=-1)  # (N, K+1)
@@ -380,16 +465,28 @@ class ModelRunner:
         accepted = []
         for i, seq in enumerate(decode_seqs):
             na = num_accepted_cpu[i]
-            seq_tokens = [t0_list[i]]
-            for k in range(na):
-                seq_tokens.append(draft_tokens_list[k][i])
+            if merged:
+                # Merged: correction already in seq, only add draft matches + new correction
+                seq_tokens = [draft_tokens_list[k][i] for k in range(na)]
+            else:
+                # Original: start with t0
+                seq_tokens = [start_list[i]]
+                for k in range(na):
+                    seq_tokens.append(draft_tokens_list[k][i])
+            # Add correction/bonus
             if na < K:
                 seq_tokens.append(target_preds_cpu[i][na])
             else:
                 seq_tokens.append(target_preds_cpu[i][K])
             accepted.append(seq_tokens)
 
-        # Update per-sequence draft KV caches (trim rejected entries)
+        # Save correction info for next cycle
+        for i, seq in enumerate(decode_seqs):
+            na = num_accepted_cpu[i]
+            self._prev_correction[seq.seq_id] = (
+                accepted[i][-1], verify_aux[i, na])
+
+        # Update draft KV caches (trim rejected entries, no correction fill)
         self._update_draft_kv(decode_seqs, past_kv, num_accepted_cpu)
 
         reset_context()
@@ -448,13 +545,85 @@ class ModelRunner:
                 batched_v[i:i+1, :, :keep, :].contiguous(),
             )
 
-    def _run_verify(self, decode_seqs: list[Sequence], t0_list: list[int],
-                    draft_tokens_list: list[list[int]]) -> torch.Tensor:
-        """Run target model verification on [t0, d1, ..., dK] for each seq.
-        Returns logits of shape (N, K+1, vocab)."""
+    def _fill_correction_tokens(self, decode_seqs, accepted, verify_aux, num_accepted_cpu):
+        """Feed correction/bonus tokens through draft model to close KV cache gaps."""
+        N = len(decode_seqs)
+        # Gather correction token and aux_hidden at the correction position
+        correction_tokens = torch.tensor(
+            [accepted[i][-1] for i in range(N)], dtype=torch.long, device="cuda")
+        correction_aux = torch.stack(
+            [verify_aux[i, num_accepted_cpu[i]] for i in range(N)])  # (N, 3*H)
+
+        # Build batched KV from just-trimmed per-seq caches
+        corr_past_kv, corr_kv_lengths = self._get_batched_draft_kv(decode_seqs)
+
+        # Run correction token through draft model
+        _, _, corr_new_kv = self.draft_model(
+            correction_tokens, correction_aux, corr_kv_lengths,
+            corr_past_kv, corr_kv_lengths
+        )
+
+        # Store updated KV (keep all entries including new correction)
+        if corr_new_kv is not None:
+            ck, cv = corr_new_kv
+            for i, seq in enumerate(decode_seqs):
+                keep = corr_kv_lengths[i].item() + 1
+                self.draft_kv_cache[seq.seq_id] = (
+                    ck[i:i+1, :, :keep, :].contiguous(),
+                    cv[i:i+1, :, :keep, :].contiguous(),
+                )
+
+    def _update_draft_kv_with_correction(self, decode_seqs, past_kv, num_accepted_cpu,
+                                          accepted, verify_aux, kv_lengths):
+        """Combined: trim rejected KV entries and fill correction token in one pass.
+        Reuses the existing batched past_kv from drafting phase to avoid rebuilding."""
+        K = self.num_speculative_tokens
+        N = len(decode_seqs)
+
+        if past_kv is None:
+            return
+
+        batched_k, batched_v = past_kv  # (N, heads, orig_max+K, dim)
+
+        # Compute trimmed lengths: original + t0 + accepted drafts
+        trimmed = [kv_lengths[i].item() + min(num_accepted_cpu[i] + 1, K) for i in range(N)]
+        trimmed_t = torch.tensor(trimmed, dtype=torch.long, device="cuda")
+
+        # Correction token inputs
+        corr_tokens = torch.tensor(
+            [accepted[i][-1] for i in range(N)], dtype=torch.long, device="cuda")
+        corr_aux = torch.stack(
+            [verify_aux[i, num_accepted_cpu[i]] for i in range(N)])  # (N, 3*H)
+
+        # Run correction through draft model, masking out rejected entries via kv_valid_lens
+        _, _, corr_kv = self.draft_model(
+            corr_tokens, corr_aux, trimmed_t,
+            (batched_k, batched_v), trimmed_t
+        )
+
+        # Store per-seq: valid [0..trimmed-1] + correction [appended at end]
+        ck, cv = corr_kv
+        end_pos = ck.shape[2] - 1  # correction entry is the last position
+        for i, seq in enumerate(decode_seqs):
+            tl = trimmed[i]
+            total = tl + 1
+            k_new = torch.empty(1, ck.shape[1], total, ck.shape[3], dtype=ck.dtype, device="cuda")
+            v_new = torch.empty(1, cv.shape[1], total, cv.shape[3], dtype=cv.dtype, device="cuda")
+            k_new[0, :, :tl] = ck[i, :, :tl]
+            k_new[0, :, tl] = ck[i, :, end_pos]
+            v_new[0, :, :tl] = cv[i, :, :tl]
+            v_new[0, :, tl] = cv[i, :, end_pos]
+            self.draft_kv_cache[seq.seq_id] = (k_new, v_new)
+
+    def _run_verify(self, decode_seqs: list[Sequence], start_list: list[int],
+                    draft_tokens_list: list[list[int]], base_offset: int = 0) -> torch.Tensor:
+        """Run target model verification on [start, d1, ..., dK] for each seq.
+        base_offset: 0 for normal mode (base_pos = len(seq)),
+                    -1 for merged mode (base_pos = len(seq)-1, correction KV not yet written).
+        Returns (logits, verify_aux) of shape (N, K+1, vocab) and (N, K+1, 3*H)."""
         K = len(draft_tokens_list)
         N = len(decode_seqs)
-        num_verify = K + 1  # t0 + all K draft tokens
+        num_verify = K + 1
 
         input_ids = []
         positions_list = []
@@ -465,11 +634,10 @@ class ModelRunner:
         max_seqlen_k = 0
 
         for i, seq in enumerate(decode_seqs):
-            # Tokens: [t0, d1, ..., dK]
-            verify_tokens = [t0_list[i]] + [draft_tokens_list[k][i] for k in range(K)]
+            verify_tokens = [start_list[i]] + [draft_tokens_list[k][i] for k in range(K)]
             input_ids.extend(verify_tokens)
 
-            base_pos = len(seq)  # position after existing context
+            base_pos = len(seq) + base_offset
             pos_range = list(range(base_pos, base_pos + num_verify))
             positions_list.extend(pos_range)
 
@@ -505,10 +673,30 @@ class ModelRunner:
             prefill_block_tables=block_tables,
         )
 
+        # Use hooks to extract aux_hidden without disturbing torch.compile
+        aux_captures = []
+        hooks = []
+        for layer_idx in sorted(self.aux_layer_ids):
+            def make_hook(idx):
+                def hook_fn(module, input, output):
+                    h, r = output
+                    aux_captures.append((idx, (h + r).detach()))
+                return hook_fn
+            hooks.append(self.model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+
         hidden_states = self.model(input_ids_t, positions_t)
+
+        for h in hooks:
+            h.remove()
+
+        aux_captures.sort(key=lambda x: x[0])
+        verify_aux = torch.cat([c[1] for c in aux_captures], dim=-1)
+
         logits = self.model.compute_logits(hidden_states)  # (N*num_verify, vocab)
         logits = logits.view(N, num_verify, -1)
-        return logits
+        verify_aux = verify_aux.view(N, num_verify, -1)
+        return logits, verify_aux
+
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
