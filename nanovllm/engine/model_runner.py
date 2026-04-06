@@ -1,3 +1,4 @@
+import json
 import pickle
 import torch
 import torch.distributed as dist
@@ -35,6 +36,14 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
+        # Speculative decoding: load draft model
+        self.draft_model = None
+        self.aux_layer_ids = None
+        self.draft_kv_cache = {}  # seq_id → (K, V) tensors for draft model
+        if config.speculative_model:
+            self._load_draft_model(config)
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -277,7 +286,229 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    # ---- Speculative decoding ----
+
+    def _load_draft_model(self, config: Config):
+        import os
+        from nanovllm.models.eagle3 import Eagle3Speculator
+        from safetensors import safe_open
+
+        spec_path = config.speculative_model
+        with open(os.path.join(spec_path, "config.json")) as f:
+            spec_config = json.load(f)
+
+        tc = spec_config["transformer_layer_config"]
+        tc["vocab_size"] = config.hf_config.vocab_size
+        self.draft_model = Eagle3Speculator({**spec_config, **tc,
+                                              "draft_vocab_size": spec_config.get("draft_vocab_size", 32000),
+                                              "target_hidden_size": spec_config.get("target_hidden_size"),
+                                              "norm_before_residual": spec_config.get("norm_before_residual", True)})
+        self.draft_model = self.draft_model.cuda()
+
+        # Load weights
+        for file in [os.path.join(spec_path, "model.safetensors")]:
+            with safe_open(file, "pt", "cpu") as f:
+                for name in f.keys():
+                    tensor = f.get_tensor(name)
+                    if name in ("d2t", "t2d"):
+                        self.draft_model.get_buffer(name).copy_(tensor)
+                    else:
+                        param = self.draft_model.get_parameter(name)
+                        param.data.copy_(tensor.to(param.dtype))
+
+        self.draft_model.eval()
+
+        # Determine auxiliary layer indices (must match vLLM/speculators default)
+        n = config.hf_config.num_hidden_layers
+        self.aux_layer_ids = {2, n // 2, n - 3}
+        self.num_speculative_tokens = config.num_speculative_tokens
+
     @torch.inference_mode()
+    def run_speculative(self, decode_seqs: list[Sequence]) -> list[list[int]]:
+        K = self.num_speculative_tokens
+        N = len(decode_seqs)
+
+        # === Phase 1: Target decode (1 token/seq) → logits + aux hidden states ===
+        input_ids, positions = self.prepare_chunked_prefill([], [], decode_seqs)
+        result = self.model(input_ids, positions, aux_layer_ids=self.aux_layer_ids)
+        hidden_states, aux_hidden = result  # aux_hidden: (N, 3*H)
+
+        target_logits = self.model.compute_logits(hidden_states)  # (N, vocab)
+        t0_tokens = target_logits.argmax(dim=-1)  # (N,)
+        reset_context()
+
+        # === Phase 2: Draft K tokens with persistent KV cache (batched) ===
+        all_draft_tokens = torch.empty(K, N, dtype=torch.long, device="cuda")
+
+        # Build batched past_kv from per-sequence caches
+        past_kv, kv_lengths = self._get_batched_draft_kv(decode_seqs)
+        draft_hidden = None
+
+        for k in range(K):
+            if k == 0:
+                d_input = t0_tokens  # (N,)
+                d_aux = aux_hidden  # (N, 3*H)
+            else:
+                d_input = all_draft_tokens[k - 1]
+                d_aux = draft_hidden  # (N, H)
+
+            # Use contiguous positions based on draft KV cache length
+            d_positions = kv_lengths + k
+
+            draft_h, draft_logits_raw, past_kv = self.draft_model(
+                d_input, d_aux, d_positions, past_kv, kv_lengths + k
+            )
+            draft_hidden = draft_h[:, -1, :]  # (N, H)
+            all_draft_tokens[k] = self.draft_model.greedy_sample(draft_logits_raw[:, -1:, :])[:, 0]
+
+        # Convert draft tokens for verify and accept
+        draft_tokens_list = [all_draft_tokens[k].tolist() for k in range(K)]
+        t0_list = t0_tokens.tolist()
+
+        # === Phase 3: Target verify (K+1 tokens/seq) ===
+        verify_logits = self._run_verify(decode_seqs, t0_list, draft_tokens_list)
+
+        # === Phase 4: Vectorized accept/reject ===
+        target_preds = verify_logits.argmax(dim=-1)  # (N, K+1)
+        draft_tokens_t = all_draft_tokens.T  # (N, K)
+        matches = (target_preds[:, :K] == draft_tokens_t)
+        num_accepted = matches.cumprod(dim=1).sum(dim=1)  # (N,)
+
+        target_preds_cpu = target_preds.tolist()
+        num_accepted_cpu = num_accepted.tolist()
+
+        accepted = []
+        for i, seq in enumerate(decode_seqs):
+            na = num_accepted_cpu[i]
+            seq_tokens = [t0_list[i]]
+            for k in range(na):
+                seq_tokens.append(draft_tokens_list[k][i])
+            if na < K:
+                seq_tokens.append(target_preds_cpu[i][na])
+            else:
+                seq_tokens.append(target_preds_cpu[i][K])
+            accepted.append(seq_tokens)
+
+        # Update per-sequence draft KV caches (trim rejected entries)
+        self._update_draft_kv(decode_seqs, past_kv, num_accepted_cpu)
+
+        reset_context()
+        return accepted
+
+    def _get_batched_draft_kv(self, decode_seqs):
+        """Build batched (K, V) from per-sequence draft KV caches, padding to max length.
+        Returns (past_kv, kv_lengths) where kv_lengths is (N,) tensor."""
+        N = len(decode_seqs)
+        kv_list = [self.draft_kv_cache.get(seq.seq_id) for seq in decode_seqs]
+
+        # Compute per-sequence KV lengths
+        lens = [kv[0].shape[2] if kv is not None else 0 for kv in kv_list]
+        kv_lengths = torch.tensor(lens, dtype=torch.long, device="cuda")
+
+        # If no sequences have cached KV, return None
+        if all(kv is None for kv in kv_list):
+            return None, kv_lengths
+
+        # Find max KV length
+        max_len = max(lens)
+        if max_len == 0:
+            return None, kv_lengths
+
+        # Get shapes from first non-None entry
+        ref_kv = next(kv for kv in kv_list if kv is not None)
+        num_kv_heads = ref_kv[0].shape[1]
+        head_dim = ref_kv[0].shape[3]
+        dtype = ref_kv[0].dtype
+
+        # Stack into batched tensors with padding
+        batched_k = torch.zeros(N, num_kv_heads, max_len, head_dim, dtype=dtype, device="cuda")
+        batched_v = torch.zeros(N, num_kv_heads, max_len, head_dim, dtype=dtype, device="cuda")
+        for i, kv in enumerate(kv_list):
+            if kv is not None:
+                L = kv[0].shape[2]
+                batched_k[i, :, :L, :] = kv[0][0]
+                batched_v[i, :, :L, :] = kv[1][0]
+
+        return (batched_k, batched_v), kv_lengths
+
+    def _update_draft_kv(self, decode_seqs, past_kv, num_accepted_cpu):
+        """Store per-sequence draft KV caches after trimming rejected entries."""
+        K = self.num_speculative_tokens
+        if past_kv is None:
+            return
+
+        batched_k, batched_v = past_kv
+        for i, seq in enumerate(decode_seqs):
+            na = num_accepted_cpu[i]
+            # We added K entries during drafting. Keep t0 + accepted drafts.
+            to_remove = max(K - na - 1, 0)
+            keep = batched_k.shape[2] - to_remove
+            self.draft_kv_cache[seq.seq_id] = (
+                batched_k[i:i+1, :, :keep, :].contiguous(),
+                batched_v[i:i+1, :, :keep, :].contiguous(),
+            )
+
+    def _run_verify(self, decode_seqs: list[Sequence], t0_list: list[int],
+                    draft_tokens_list: list[list[int]]) -> torch.Tensor:
+        """Run target model verification on [t0, d1, ..., dK] for each seq.
+        Returns logits of shape (N, K+1, vocab)."""
+        K = len(draft_tokens_list)
+        N = len(decode_seqs)
+        num_verify = K + 1  # t0 + all K draft tokens
+
+        input_ids = []
+        positions_list = []
+        slot_mapping = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = num_verify
+        max_seqlen_k = 0
+
+        for i, seq in enumerate(decode_seqs):
+            # Tokens: [t0, d1, ..., dK]
+            verify_tokens = [t0_list[i]] + [draft_tokens_list[k][i] for k in range(K)]
+            input_ids.extend(verify_tokens)
+
+            base_pos = len(seq)  # position after existing context
+            pos_range = list(range(base_pos, base_pos + num_verify))
+            positions_list.extend(pos_range)
+
+            # Slot mapping for the num_verify new positions
+            for p in range(num_verify):
+                abs_pos = base_pos + p
+                block_idx = abs_pos // self.block_size
+                offset = abs_pos % self.block_size
+                physical = seq.block_table[block_idx]
+                slot_mapping.append(physical * self.block_size + offset)
+
+            cu_seqlens_q.append(cu_seqlens_q[-1] + num_verify)
+            seqlen_k = base_pos + num_verify
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_k = max(max_seqlen_k, seqlen_k)
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions_t = torch.tensor(positions_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        # Need block tables for reading from KV cache
+        block_tables = self.prepare_block_tables(decode_seqs)
+
+        set_context(
+            num_prefill_tokens=N * num_verify,
+            slot_mapping=slot_mapping_t,
+            cu_seqlens_q=cu_seqlens_q_t,
+            cu_seqlens_k=cu_seqlens_k_t,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            prefill_block_tables=block_tables,
+        )
+
+        hidden_states = self.model(input_ids_t, positions_t)
+        logits = self.model.compute_logits(hidden_states)  # (N*num_verify, vocab)
+        logits = logits.view(N, num_verify, -1)
+        return logits
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config

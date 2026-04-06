@@ -91,22 +91,44 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        if len(seq) % self.block_size == 1 and len(seq.block_table) >= seq.num_blocks:
+            return True  # Block already pre-allocated (speculative path)
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
+            if len(block_table) >= seq.num_blocks:
+                return  # Block already pre-allocated (speculative path)
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            assert last_block.hash == -1
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks-1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+
+    def ensure_slots(self, seq: Sequence, num_tokens: int) -> bool:
+        """Pre-allocate enough blocks for num_tokens additional tokens.
+        Returns True if allocation succeeded."""
+        current_len = len(seq)
+        needed_blocks = 0
+        for t in range(1, num_tokens + 1):
+            future_len = current_len + t
+            if future_len % self.block_size == 1:
+                needed_blocks += 1
+        if needed_blocks > len(self.free_block_ids):
+            return False
+        # Allocate the needed blocks
+        for t in range(1, num_tokens + 1):
+            future_len = current_len + t
+            if future_len % self.block_size == 1:
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                seq.block_table.append(block_id)
+        return True

@@ -119,3 +119,44 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def ensure_speculative_slots(self, decode_seqs: list[Sequence], num_tokens: int):
+        """Pre-allocate blocks for speculative tokens. Returns seqs that can speculate."""
+        ok_seqs = []
+        for seq in decode_seqs:
+            if self.block_manager.ensure_slots(seq, num_tokens):
+                ok_seqs.append(seq)
+        return ok_seqs
+
+    def postprocess_speculative(self, decode_seqs: list[Sequence],
+                                 accepted_tokens: list[list[int]]):
+        """Process results from speculative decoding (variable tokens per seq).
+        Blocks were pre-allocated via ensure_speculative_slots, so we skip may_append."""
+        for seq, tokens in zip(decode_seqs, accepted_tokens):
+            for token_id in tokens:
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    break
+            if not seq.is_finished:
+                # Clean up unused pre-allocated blocks
+                needed_blocks = seq.num_blocks
+                while len(seq.block_table) > needed_blocks:
+                    block_id = seq.block_table.pop()
+                    block = self.block_manager.blocks[block_id]
+                    block.ref_count -= 1
+                    if block.ref_count == 0:
+                        self.block_manager._deallocate_block(block_id)
+                # Hash any full blocks that aren't hashed yet
+                bm = self.block_manager
+                for i in range(len(seq.block_table)):
+                    block = bm.blocks[seq.block_table[i]]
+                    is_full = (i < len(seq.block_table) - 1) or (len(seq) % bm.block_size == 0)
+                    if is_full and block.hash == -1:
+                        token_ids = seq.block(i)
+                        prefix = bm.blocks[seq.block_table[i-1]].hash if i > 0 else -1
+                        h = bm.compute_hash(token_ids, prefix)
+                        block.update(h, token_ids)
+                        bm.hash_to_block_id[h] = block.block_id

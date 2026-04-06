@@ -7,7 +7,7 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from nanovllm.kernels.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, gather_kv_from_cache
+from nanovllm.kernels.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, flash_attn_paged_prefill, gather_kv_from_cache
 from nanovllm.utils.context import get_context
 
 USE_NAIVE_ATTN = os.environ.get("NANO_NAIVE_ATTN", "0") == "1"
@@ -137,10 +137,13 @@ class Attention(nn.Module):
         if n > 0:
             pq, pk, pv = q[:n], k[:n], v[:n]
             if context.prefill_block_tables is not None:
-                block_size = k_cache.shape[1]
-                pk, pv = gather_kv_from_cache(k_cache, v_cache, context.prefill_block_tables,
-                                              context.cu_seqlens_k, block_size)
-            if USE_NAIVE_ATTN:
+                # Use paged prefill kernel — reads K/V directly from cache
+                po = flash_attn_paged_prefill(pq, k_cache, v_cache, context.prefill_block_tables,
+                                              cu_seqlens_q=context.cu_seqlens_q,
+                                              cu_seqlens_k=context.cu_seqlens_k,
+                                              max_seqlen_q=context.max_seqlen_q,
+                                              softmax_scale=self.scale)
+            elif USE_NAIVE_ATTN:
                 po = naive_attn_prefill(pq, pk, pv,
                                         cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
                                         softmax_scale=self.scale, num_kv_heads=self.num_kv_heads)

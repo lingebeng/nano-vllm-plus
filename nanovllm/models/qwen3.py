@@ -173,12 +173,18 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        aux_layer_ids: set | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = []
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if aux_layer_ids is not None and i in aux_layer_ids:
+                aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_layer_ids is not None:
+            return hidden_states, torch.cat(aux_hidden_states, dim=-1)
         return hidden_states
 
 
@@ -205,8 +211,9 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        aux_layer_ids: set | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.model(input_ids, positions, aux_layer_ids=aux_layer_ids)
 
     def compute_logits(
         self,

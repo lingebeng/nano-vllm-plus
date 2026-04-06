@@ -13,6 +13,8 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     enable_chunked_prefill: bool = True
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 3
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

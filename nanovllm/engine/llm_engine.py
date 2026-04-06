@@ -31,6 +31,8 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.speculative = config.speculative_model is not None
+        self._spec_stats = {'total_tokens': 0, 'cycles': 0, 'total_seqs': 0}
         atexit.register(self.exit)
 
     def exit(self):
@@ -50,11 +52,23 @@ class LLMEngine:
 
     def step(self):
         prefill_seqs, chunk_sizes, decode_seqs = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", prefill_seqs, chunk_sizes, decode_seqs)
-        self.scheduler.postprocess(prefill_seqs, chunk_sizes, decode_seqs, token_ids)
+        if self.speculative and not prefill_seqs and decode_seqs:
+            # Speculative decode path
+            K = self.model_runner.num_speculative_tokens
+            self.scheduler.ensure_speculative_slots(decode_seqs, K + 2)  # K+1 verify + 1 bonus
+            accepted = self.model_runner.call("run_speculative", decode_seqs)
+            self.scheduler.postprocess_speculative(decode_seqs, accepted)
+            self._spec_stats['cycles'] += 1
+            self._spec_stats['total_seqs'] += len(decode_seqs)
+            self._spec_stats['total_tokens'] += sum(len(a) for a in accepted)
+            num_prefill_tokens = 0
+        else:
+            # Normal path
+            token_ids = self.model_runner.call("run", prefill_seqs, chunk_sizes, decode_seqs)
+            self.scheduler.postprocess(prefill_seqs, chunk_sizes, decode_seqs, token_ids)
+            num_prefill_tokens = sum(chunk_sizes)
         all_seqs = prefill_seqs + decode_seqs
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in all_seqs if seq.is_finished]
-        num_prefill_tokens = sum(chunk_sizes)
         decode_seq_ids = [seq.seq_id for seq in decode_seqs]
         first_token_seq_ids = [seq.seq_id for seq in prefill_seqs
                                if not seq.is_prefilling and seq.num_completion_tokens >= 1]

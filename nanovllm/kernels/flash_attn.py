@@ -50,6 +50,9 @@ def _fwd_kernel(
     off_h = off_hb % nheads
     off_kv_h = off_h // GQA_RATIO
 
+    # Causal offset for bottom-right aligned masking (seqlen_q <= seqlen_k)
+    causal_offset = seqlen_k - seqlen_q
+
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -80,7 +83,7 @@ def _fwd_kernel(
                         other=0.0)
 
     # loop over k, v and update accumulator
-    end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
+    end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M + causal_offset, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- load k --
@@ -105,7 +108,7 @@ def _fwd_kernel(
         if not EVEN_N:
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
         if IS_CAUSAL:
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+            qk += tl.where((offs_m + causal_offset)[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
 
         # -- online softmax --
         m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
@@ -361,6 +364,175 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=None,
     )
 
     return o_flat.unsqueeze(1)  # (batch, 1, nheads, headdim)
+
+
+# ============================================================
+# Paged Attention Prefill Kernel (for verify / prefix-cached prefill)
+# Reads K/V directly from paged cache via block tables,
+# eliminating the need for gather_kv_from_cache.
+# ============================================================
+
+@triton.jit
+def _paged_attn_prefill_kernel(
+    Q, K_cache, V_cache, Out,
+    block_table_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    softmax_scale,
+    stride_qm, stride_qh,
+    stride_cache_block, stride_cache_seq, stride_cache_head,
+    stride_om, stride_oh,
+    stride_bt_b,
+    nheads_kv,
+    NUM_Q_TILES: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Grid: (num_seqs * NUM_Q_TILES, nheads)
+    program_idx = tl.program_id(0)
+    seq_idx = program_idx // NUM_Q_TILES
+    q_tile_idx = program_idx % NUM_Q_TILES
+    head_idx = tl.program_id(1)
+    kv_head = head_idx // GQA_RATIO
+
+    # Per-sequence lengths from cu_seqlens
+    q_start = tl.load(cu_seqlens_q_ptr + seq_idx)
+    q_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    seqlen_q = q_end - q_start
+
+    k_start = tl.load(cu_seqlens_k_ptr + seq_idx)
+    k_end = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seqlen_k = k_end - k_start
+
+    # Bottom-right aligned causal offset
+    causal_offset = seqlen_k - seqlen_q
+
+    # Q tile offset within this sequence
+    q_tile_start = q_tile_idx * BLOCK_Q
+
+    # Load Q: (BLOCK_Q, BLOCK_HEADDIM)
+    offs_q = tl.arange(0, BLOCK_Q)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    q_ptrs = Q + (q_start + q_tile_start + offs_q[:, None]) * stride_qm + head_idx * stride_qh + offs_d[None, :]
+    q_mask = (q_tile_start + offs_q[:, None]) < seqlen_q
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+
+    # Per-query online softmax accumulators
+    m_i = tl.full([BLOCK_Q], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_Q, BLOCK_HEADDIM], dtype=tl.float32)
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    # Causal end: last K position this Q tile can see
+    end_n = tl.minimum(seqlen_k, (q_tile_start + BLOCK_Q) + causal_offset)
+
+    # Iterate over KV cache in tiles of BLOCK_N
+    for start_n in range(0, end_n, BLOCK_N):
+        block_idx = start_n // BLOCK_SIZE
+        offset_in_block = start_n % BLOCK_SIZE
+        physical_block = tl.load(block_table_ptr + seq_idx * stride_bt_b + block_idx)
+
+        # Load K tile: (BLOCK_N, BLOCK_HEADDIM) from paged cache
+        k_base = K_cache + physical_block * stride_cache_block + kv_head * stride_cache_head
+        k_ptrs = k_base + (offset_in_block + offs_n)[:, None] * stride_cache_seq + offs_d[None, :]
+        mask_n = (start_n + offs_n) < seqlen_k
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+
+        # QK: (BLOCK_Q, BLOCK_N) — tl.dot produces float32
+        qk = tl.zeros([BLOCK_Q, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, tl.trans(k))
+        qk *= softmax_scale
+
+        # Mask invalid K positions
+        qk += tl.where(mask_n[None, :], 0, float("-inf"))
+        # Causal mask
+        qk += tl.where((q_tile_start + offs_q + causal_offset)[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+        # Mask padded Q rows
+        qk += tl.where((q_tile_start + offs_q)[:, None] < seqlen_q, 0, float("-inf"))
+
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        exp_qk = tl.exp(qk - m_new[:, None])
+        l_new = tl.exp(m_i - m_new) * l_i + tl.sum(exp_qk, axis=1)
+
+        # Load V tile: (BLOCK_N, BLOCK_HEADDIM) from paged cache
+        v_base = V_cache + physical_block * stride_cache_block + kv_head * stride_cache_head
+        v_ptrs = v_base + (offset_in_block + offs_n)[:, None] * stride_cache_seq + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+        # Rescale and accumulate
+        acc = acc * tl.exp(m_i - m_new)[:, None]
+        acc += tl.dot(exp_qk.to(v.dtype), v)
+
+        m_i = m_new
+        l_i = l_new
+
+    # Normalize
+    acc = acc / l_i[:, None]
+
+    # Store output for valid Q positions
+    out_ptrs = Out + (q_start + q_tile_start + offs_q[:, None]) * stride_om + head_idx * stride_oh + offs_d[None, :]
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=(q_tile_start + offs_q)[:, None] < seqlen_q)
+
+
+def flash_attn_paged_prefill(q, k_cache, v_cache, block_table,
+                              cu_seqlens_q, cu_seqlens_k,
+                              max_seqlen_q, softmax_scale=None):
+    """
+    Prefill attention reading K/V directly from paged cache.
+
+    q: (total_q, nheads, headdim)
+    k_cache: (num_blocks, block_size, nheads_kv, headdim)
+    v_cache: (num_blocks, block_size, nheads_kv, headdim)
+    block_table: (num_seqs, max_blocks_per_seq)
+    cu_seqlens_q: (num_seqs + 1,)
+    cu_seqlens_k: (num_seqs + 1,)
+    max_seqlen_q: int
+    Returns: (total_q, nheads, headdim)
+    """
+    nheads = q.shape[1]
+    headdim = q.shape[2]
+    nheads_kv = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    num_seqs = block_table.shape[0]
+
+    assert nheads % nheads_kv == 0
+    gqa_ratio = nheads // nheads_kv
+    softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
+
+    output = torch.empty_like(q)
+
+    BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
+    BLOCK_Q = 64  # fixed tile size to stay within shared memory limits
+    BLOCK_N = min(128, block_size)
+    assert block_size % BLOCK_N == 0
+
+    num_q_tiles = triton.cdiv(max_seqlen_q, BLOCK_Q)
+    grid = (num_seqs * num_q_tiles, nheads)
+    _paged_attn_prefill_kernel[grid](
+        q, k_cache, v_cache, output,
+        block_table,
+        cu_seqlens_q, cu_seqlens_k,
+        softmax_scale,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        output.stride(0), output.stride(1),
+        block_table.stride(0),
+        nheads_kv,
+        num_q_tiles,
+        gqa_ratio,
+        block_size,
+        BLOCK_HEADDIM,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
 
 
 # ============================================================
