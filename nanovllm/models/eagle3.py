@@ -2,9 +2,26 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.rotary_embedding import RotaryEmbedding
+
+
+class Eagle3RMSNorm(nn.Module):
+    """Standalone RMSNorm for draft model — no @torch.compile to avoid
+    triggering recompilation of the target model's compiled RMSNorm
+    (which expects 2D tensors, while the draft model passes 3D)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return x.to(orig_dtype) * self.weight
 
 
 class Eagle3Attention(nn.Module):
@@ -93,9 +110,9 @@ class Eagle3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.norm_before_residual = norm_before_residual
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.hidden_norm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = Eagle3Attention(hidden_size, num_heads, num_kv_heads,
                                          head_dim, max_position, rope_theta)
         self.mlp = Eagle3MLP(hidden_size, intermediate_size)
@@ -148,7 +165,7 @@ class Eagle3Speculator(nn.Module):
             rms_norm_eps=tc.get("rms_norm_eps", 1e-6),
             norm_before_residual=config.get("norm_before_residual", True),
         )])
-        self.norm = RMSNorm(self.hidden_size, eps=tc.get("rms_norm_eps", 1e-6))
+        self.norm = Eagle3RMSNorm(self.hidden_size, eps=tc.get("rms_norm_eps", 1e-6))
         self.lm_head = nn.Linear(self.hidden_size, self.draft_vocab_size, bias=False)
 
         self.register_buffer("d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long))

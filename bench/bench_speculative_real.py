@@ -14,6 +14,8 @@ PROMPT = """Explain the theory of general relativity in detail. Cover the follow
 6. Relationship to quantum mechanics and the search for quantum gravity
 Please be thorough and provide mathematical intuition where appropriate."""
 
+NUM_TRIALS = 3  # Run multiple trials to account for torch.compile non-determinism
+
 
 def run_bench(path, speculative_model=None, num_seqs=16, max_tokens=512):
     """Run benchmark with real text prompts, report acceptance rate."""
@@ -56,9 +58,10 @@ stats = llm._spec_stats
 
 result = {{"total": total, "elapsed": elapsed, "throughput": total / elapsed}}
 if stats['cycles'] > 0:
-    avg_tokens_per_seq = stats['total_tokens'] / stats['total_seqs']
-    result["avg_tokens_per_cycle"] = avg_tokens_per_seq
+    result["avg_tokens_per_cycle"] = stats['total_tokens'] / stats['total_seqs']
     result["spec_cycles"] = stats['cycles']
+    result["total_accepted"] = stats['total_tokens']
+    result["total_seqs"] = stats['total_seqs']
 print(json.dumps(result))
 """],
         capture_output=True, text=True,
@@ -84,21 +87,47 @@ def main():
         print(f"  Batch={num_seqs}, max_tokens=512, real text")
         print("=" * 60)
 
+        # Baseline: single run (deterministic enough)
         print("  Baseline...")
         r = run_bench(path, None, num_seqs, 512)
         baseline = r['throughput']
         print(f"    {r['elapsed']:.2f}s, {baseline:.1f} tok/s")
 
-        print("  Speculative (EAGLE3, K=3)...")
-        r = run_bench(path, spec_path, num_seqs, 512)
-        spec = r['throughput']
-        avg_tok = r.get('avg_tokens_per_cycle', 0)
-        print(f"    {r['elapsed']:.2f}s, {spec:.1f} tok/s")
-        if avg_tok > 0:
-            print(f"    Avg tokens/seq/cycle: {avg_tok:.2f} (max={3+2}=5)")
-            print(f"    Draft acceptance: {(avg_tok - 2) / 3 * 100:.0f}%")
+        # Speculative: multiple trials (torch.compile causes non-determinism)
+        print(f"  Speculative (EAGLE3, K=3) x{NUM_TRIALS} trials...")
+        trial_results = []
+        for trial in range(NUM_TRIALS):
+            r = run_bench(path, spec_path, num_seqs, 512)
+            avg_tok = r.get('avg_tokens_per_cycle', 0)
+            cycles = r.get('spec_cycles', 0)
+            trial_results.append({
+                'throughput': r['throughput'],
+                'avg_tok': avg_tok,
+                'cycles': cycles,
+                'elapsed': r['elapsed'],
+            })
+            speedup = r['throughput'] / baseline
+            # Acceptance rate: first cycle produces na+2 (non-merged), rest produce na+1 (merged)
+            # avg_tok ≈ (na+2 + (cycles-1)*(na+1)) / cycles ≈ na+1 + 1/cycles
+            # For large cycles: draft_accept ≈ (avg_tok - 1 - 1/cycles) / K
+            K = 3
+            if cycles > 0:
+                accept = (avg_tok - 1.0 - 1.0 / cycles) / K
+            else:
+                accept = 0
+            print(f"    Trial {trial+1}: {r['throughput']:.1f} tok/s, "
+                  f"avg_tok/cycle={avg_tok:.2f}, accept={accept*100:.0f}%, "
+                  f"speedup={speedup:.2f}x")
 
-        print(f"  Speedup: {spec / baseline:.2f}x")
+        # Summary
+        throughputs = [t['throughput'] for t in trial_results]
+        avg_toks = [t['avg_tok'] for t in trial_results]
+        mean_tp = sum(throughputs) / len(throughputs)
+        mean_at = sum(avg_toks) / len(avg_toks)
+        mean_speedup = mean_tp / baseline
+        print(f"  Summary: {mean_tp:.1f} tok/s (range {min(throughputs):.1f}-{max(throughputs):.1f}), "
+              f"avg_tok/cycle={mean_at:.2f}, speedup={mean_speedup:.2f}x")
+        print()
 
 
 if __name__ == "__main__":
