@@ -228,7 +228,7 @@ def main():
         return
 
     seed(0)
-    model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    model_path = os.path.expanduser("~/huggingface/Qwen3-8B/")
     num_seqs = 256
     max_input_len = 1024
     max_output_len = 1024

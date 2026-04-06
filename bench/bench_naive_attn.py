@@ -15,7 +15,7 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/huggingface/Qwen3-8B/")
 
     os.environ["NANO_NAIVE_ATTN"] = "1"
     llm = LLM(path, enforce_eager=True, enable_chunked_prefill=False, max_model_len=4096)

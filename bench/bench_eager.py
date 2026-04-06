@@ -10,7 +10,7 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/huggingface/Qwen3-8B/")
     # enforce_eager=True to skip CUDA graph (naive attn doesn't support it)
     llm = LLM(path, enforce_eager=True, enable_chunked_prefill=False, max_model_len=4096)
 

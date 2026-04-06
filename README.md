@@ -26,8 +26,8 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 To download the model weights manually, use the following command:
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
+huggingface-cli download --resume-download Qwen/Qwen3-8B \
+  --local-dir ~/huggingface/Qwen3-8B/ \
   --local-dir-use-symlinks False
 ```
 
@@ -49,7 +49,7 @@ See `bench.py` for benchmark.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
+- Model: Qwen3-8B
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
